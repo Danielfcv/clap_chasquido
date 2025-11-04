@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Audio → Color (Teachable Machine)</title>
+  <style>
+    :root { --radius: 14px; --pad: 16px; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Segoe UI Emoji"; margin: 0; background: #f8fafc; transition: background-color .35s ease; }
+    .wrap { max-width: 860px; margin: 28px auto; padding: 0 18px 42px; }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    p.lead { margin: 0 0 16px; color: #334155; }
+    .card { background: white; border-radius: var(--radius); box-shadow: 0 10px 24px rgba(2,6,23,.06), 0 2px 6px rgba(2,6,23,.06); padding: var(--pad); }
+    .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+    button { appearance: none; border: 0; background: #111827; color: white; padding: 10px 14px; border-radius: 999px; cursor: pointer; font-weight: 600; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    label { font-size: 14px; color: #1f2937; display: flex; align-items: center; gap: 8px; }
+    input[type=range] { accent-color: #111827; }
+    .grid { display: grid; grid-template-columns: 160px 1fr; gap: 10px 16px; align-items: center; }
+    .class-name { font-weight: 600; color: #111827; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bar { height: 10px; background: #eef2ff; border-radius: 999px; overflow: hidden; }
+    .fill { height: 100%; width: 0%; background: #6366f1; transition: width .12s linear; }
+    .row { display: contents; }
+    .status { margin-top: 12px; font-weight: 600; color: #111827; }
+    .hint { margin-top: 6px; color: #475569; font-size: 13px; }
+    .footer { margin-top: 14px; color: #64748b; font-size: 12px; }
+    .note { background: #fff7ed; border: 1px dashed #fdba74; padding: 8px 10px; border-radius: 10px; font-size: 13px; color: #7c2d12; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Audio → Color (con Teachable Machine)</h1>
+      <p class="lead">Detecta sonidos como <strong>Clap</strong>, <strong>Chasquido</strong> o <strong>Ruido de fondo</strong> y cambia el color del fondo según la clase con mayor probabilidad.</p>
+
+      <div class="controls">
+        <button id="startBtn">Iniciar micrófono</button>
+        <label>Umbral <input id="th" type="range" min="0.5" max="0.99" step="0.01" value="0.95"><span id="thv">0.95</span></label>
+      </div>
+
+      <div id="labels" class="grid" style="margin-top: 14px;"></div>
+      <div id="status" class="status">Listo.</div>
+      <div class="hint">Consejo: si el color parpadea, sube el umbral o añade más datos de entrenamiento.</div>
+      <div class="footer">Micrófono: recuerda permitir el acceso cuando el navegador lo solicite.</div>
+    </div>
+  </div>
+
+  <!-- Librerías (TFJS) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+
+  <!-- Teachable Machine (audio) UMD global -->
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/audio@0.8/dist/teachablemachine-audio.min.js"></script>
+
+  <!-- Fallback: si el UMD no cargó, intenta ESM y expón window.tmAudio -->
+  <script type="module">
+    if (!window.tmAudio) {
+      try {
+        const mod = await import('https://cdn.jsdelivr.net/npm/@teachablemachine/audio@0.8/dist/teachablemachine-audio.esm.js');
+        window.tmAudio = mod;
+        console.info('tmAudio cargado vía ESM.');
+      } catch (e) {
+        try {
+          const mod = await import('https://unpkg.com/@teachablemachine/audio@0.8/dist/teachablemachine-audio.esm.js');
+          window.tmAudio = mod;
+          console.info('tmAudio cargado vía ESM (unpkg).');
+        } catch (err) {
+          console.error('No se pudo cargar tmAudio desde los CDNs.', err);
+        }
+      }
+    }
+  </script>
+
+  <script>
+    // URL de tu modelo (debe terminar con "/")
+    const URL = "https://teachablemachine.withgoogle.com/models/vddFqxPQn/"; 
+
+    // Mapa clase → color de fondo
+    const colorMap = {
+      "Clap": "#ffe4e6",
+      "Chasquido": "#dcfce7",
+      "Ruido de fondo": "#dbeafe"
+    };
+
+    let model, mic, classLabels = [], busy = false;
+    // Suavizado: exige que la misma clase se repita varias veces antes de cambiar el color
+    let stableLabel = null, stableCount = 0; 
+    const REQUIRED_STABLE = 3; // frames consecutivos necesarios
+    const labelsEl = document.getElementById('labels');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const thInput = document.getElementById('th');
+    const thVal = document.getElementById('thv');
+    thInput.addEventListener('input', () => thVal.textContent = Number(thInput.value).toFixed(2));
+
+    startBtn.addEventListener('click', init);
+
+    function colorFor(label){
+      if (colorMap[label]) return colorMap[label];
+      // Fallback: color HSL estable derivado del texto
+      let h = 0; for (let i=0; i<label.length; i++) h = (h*31 + label.charCodeAt(i)) % 360;
+      return `hsl(${h} 80% 92%)`;
+    }
+
+    async function init(){
+      startBtn.disabled = true;
+      statusEl.textContent = 'Cargando modelo…';
+      try {
+        if (!window.tmAudio) throw new Error('La librería de Teachable Machine (audio) no cargó. Revisa tu conexión/bloqueadores y recarga.');
+
+        const modelURL = URL + 'model.json';
+        const metadataURL = URL + 'metadata.json';
+        model = await window.tmAudio.load(modelURL, metadataURL);
+
+        // Preparar micrófono
+        mic = new window.tmAudio.Microphone();
+        await mic.setup(); // solicita permiso
+        await mic.play();
+
+        // Una predicción inicial para conocer las clases y construir la UI
+        const first = await model.predict(mic);
+        classLabels = first.map(p => p.className);
+        buildLabelUI(classLabels);
+        renderBars(first);
+
+        statusEl.textContent = 'Escuchando…';
+        loop();
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Error: ' + (err && err.message ? err.message : err);
+        startBtn.disabled = false;
+      }
+    }
+
+    function buildLabelUI(labels){
+      labelsEl.innerHTML = '';
+      labels.forEach(name => {
+        const nameDiv = document.createElement('div');
+        nameDiv.className = 'class-name';
+        nameDiv.textContent = name;
+
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        const fill = document.createElement('div');
+        fill.className = 'fill';
+        bar.appendChild(fill);
+
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.appendChild(nameDiv);
+        row.appendChild(bar);
+        labelsEl.appendChild(row);
+      });
+    }
+
+    function renderBars(preds){
+      // Actualiza barras y devuelve la mejor clase
+      let top = preds[0];
+      preds.forEach((p, i) => {
+        if (p.probability > top.probability) top = p;
+        const row = labelsEl.children[i];
+        const fill = row.querySelector('.fill');
+        fill.style.width = (p.probability * 100).toFixed(1) + '%';
+      });
+      return top;
+    }
+
+    async function loop(){
+      if (!model || !mic) return;
+      if (busy) { requestAnimationFrame(loop); return; }
+      busy = true;
+      try {
+        const preds = await model.predict(mic);
+        const top = renderBars(preds);
+
+        const threshold = parseFloat(thInput.value);
+
+        // Acumular estabilidad
+        if (top.className === stableLabel){
+          stableCount++;
+        } else {
+          stableLabel = top.className;
+          stableCount = 1;
+        }
+
+        if (top.probability >= threshold && stableCount >= REQUIRED_STABLE){
+          document.body.style.backgroundColor = colorFor(top.className);
+          statusEl.textContent = `Top: ${top.className} (${top.probability.toFixed(2)})`;
+        } else if (top.probability < threshold) {
+          statusEl.textContent = `Ninguna clase supera el umbral (${threshold.toFixed(2)})`;
+        } else {\n          statusEl.textContent = `Esperando estabilidad… (${stableCount}/${REQUIRED_STABLE})`;
+        }\n      } catch(e){\n        console.error(e);\n      } finally {\n        busy = false;\n        requestAnimationFrame(loop);\n      }\n    }\n  </script>\n</body>\n</html>\n
